@@ -20,6 +20,7 @@ import { EvalLogger } from "./logger";
 import type { StagehandInitResult } from "@/types/evals";
 import type { AgentConfig } from "@/dist";
 import { AvailableModel } from "@browserbasehq/stagehand";
+import { modelToAgentProviderMap } from "@/lib/agent/AgentProvider";
 
 /**
  * StagehandConfig:
@@ -29,7 +30,8 @@ import { AvailableModel } from "@browserbasehq/stagehand";
  *
  * Adjust or remove fields as appropriate for your environment.
  */
-const StagehandConfig = {
+// Base configuration without async values
+const BaseStagehandConfig = {
   env: env,
   apiKey: process.env.BROWSERBASE_API_KEY,
   projectId: process.env.BROWSERBASE_PROJECT_ID,
@@ -38,18 +40,13 @@ const StagehandConfig = {
   debugDom: true,
   headless: false,
   enableCaching,
-  domSettleTimeoutMs: 30_000,
+  domSettleTimeoutMs: 60_000,
   disablePino: true,
-  browserbaseSessionCreateParams: {
-    projectId: process.env.BROWSERBASE_PROJECT_ID!,
-    browserSettings: {
-      viewport: {
-        width: 1024,
-        height: 768,
-      },
-    },
-  },
   selfHeal: true,
+  modelName: "google/gemini-2.5-flash",
+  modelClientOptions: {
+    apiKey: process.env.GEMINI_API_KEY,
+  },
 };
 
 /**
@@ -81,7 +78,7 @@ export const initStagehand = async ({
   modelName: AvailableModel;
 }): Promise<StagehandInitResult> => {
   const config = {
-    ...StagehandConfig,
+    ...BaseStagehandConfig,
     modelClientOptions,
     llmClient,
     ...(domSettleTimeoutMs && { domSettleTimeoutMs }),
@@ -90,45 +87,57 @@ export const initStagehand = async ({
     experimental:
       typeof configOverrides?.experimental === "boolean"
         ? configOverrides.experimental
-        : !StagehandConfig.useAPI,
+        : !BaseStagehandConfig.useAPI,
+    browserbaseSessionCreateParams: {
+      projectId: process.env.BROWSERBASE_PROJECT_ID!,
+      // proxies: true,
+      browserSettings: {
+        enablePdfViewer: true,
+        // advancedStealth: true,
+        // os: "windows",
+        viewport: {
+          width: 1288,
+          height: 711,
+        },
+      },
+    },
     ...configOverrides,
     logger: logger.log.bind(logger),
   };
 
-  const stagehand = new Stagehand(config);
+  try {
+    const stagehand = new Stagehand(config);
 
-  // Associate the logger with the Stagehand instance
-  logger.init(stagehand);
+    // Associate the logger with the Stagehand instance
+    logger.init(stagehand);
 
-  const { debugUrl, sessionUrl } = await stagehand.init();
+    const { debugUrl, sessionUrl } = await stagehand.init();
 
-  // Set navigation timeout to 60 seconds for evaluations
-  stagehand.context.setDefaultNavigationTimeout(60_000);
+    // Set navigation timeout to 60 seconds for evaluations
+    stagehand.context.setDefaultNavigationTimeout(60_000);
 
-  const isCUAModel = (model: string): boolean =>
-    model.includes("computer-use-preview") || model.startsWith("claude");
+    let agentConfig: AgentConfig | undefined;
+    if (modelName in modelToAgentProviderMap) {
+      agentConfig = {
+        model: modelName,
+        provider: modelToAgentProviderMap[modelName],
+        instructions: `You are a helpful assistant that must solve the task by browsing. At the end, produce a single line: "Final Answer: <answer>" summarizing the requested result (e.g., score, list, or text). Current page: ${await stagehand.page.title()}. ALWAYS OPERATE WITHIN THE PAGE OPENED BY THE USER, WHICHEVER TASK YOU ARE ATTEMPTING TO COMPLETE CAN BE ACCOMPLISHED WITHIN THE PAGE. Simply perform the task provided, do not overthink or overdo it. The user trusts you to complete the task without any additional instructions, or answering any questions.`,
+      } as AgentConfig;
+    }
 
-  let agentConfig: AgentConfig | undefined;
-  if (isCUAModel(modelName)) {
-    agentConfig = {
-      model: modelName,
-      provider: modelName.startsWith("claude") ? "anthropic" : "openai",
-    } as AgentConfig;
-  } else {
-    agentConfig = {
-      model: modelName,
-    } as AgentConfig;
+    const agent = stagehand.agent(agentConfig);
+
+    return {
+      stagehand,
+      stagehandConfig: config,
+      logger,
+      debugUrl,
+      sessionUrl,
+      modelName,
+      agent,
+    };
+  } catch (error) {
+    console.error("Error initializing stagehand:", error);
+    throw error;
   }
-
-  const agent = stagehand.agent(agentConfig);
-
-  return {
-    stagehand,
-    stagehandConfig: config,
-    logger,
-    debugUrl,
-    sessionUrl,
-    modelName,
-    agent,
-  };
 };
